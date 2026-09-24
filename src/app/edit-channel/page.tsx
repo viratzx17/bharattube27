@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -17,13 +17,34 @@ import {
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { UserAvatar } from "@/components/VideoComponents";
 import { useApp } from "@/context/AppContext";
-import { apiUrl } from "@/lib/api-config";
 
 const HANDLE_RE = /^[a-z0-9_]{3,30}$/;
 
+/** Channel shape returned by GET /api/channel (backend + local edits merged). */
+interface ChannelData {
+  id: string;
+  handle: string;
+  channelName: string;
+  description: string;
+  contactEmail: string | null;
+  profilePhotoUrl: string | null;
+  bannerUrl: string | null;
+  links: { label: string; url: string }[];
+}
+
 function EditChannelContent() {
-  const { user, channel, refreshUser, triggerFeedRefresh, showToast } = useApp();
+  const { user, triggerFeedRefresh, showToast } = useApp();
   const router = useRouter();
+
+  /**
+   * The channel is loaded from the same-origin /api/channel route, which
+   * merges the external backend's channel (subscribers/videos/views) with
+   * this deployment's stored edits. The context value is always null for
+   * the external backend, so the page owns its own channel state.
+   */
+  const [channel, setChannel] = useState<ChannelData | null>(null);
+  const [loadingChannel, setLoadingChannel] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   const [channelName, setChannelName] = useState("");
   const [handle, setHandle] = useState("");
@@ -41,19 +62,50 @@ function EditChannelContent() {
   const photoInputRef = useRef<HTMLInputElement>(null);
   const bannerInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (channel) {
-      setChannelName(channel.channelName || "");
-      setHandle(channel.handle || "");
-      setDescription(channel.description || "");
-      setContactEmail(channel.contactEmail || "");
-      setProfilePhotoUrl(channel.profilePhotoUrl);
-      setBannerUrl(channel.bannerUrl);
-      setLinks(Array.isArray(channel.links) ? channel.links : []);
+  const loadChannel = useCallback(async () => {
+    if (!user) return;
+    setLoadingChannel(true);
+    setLoadError("");
+    try {
+      const res = await fetch("/api/channel", {
+        cache: "no-store",
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        setLoadError(
+          data?.error || "Could not load your channel. Please try again."
+        );
+        return;
+      }
+      setChannel(data.data as ChannelData);
+    } catch {
+      setLoadError(
+        "Unable to connect. Please check your internet connection and try again."
+      );
+    } finally {
+      setLoadingChannel(false);
     }
-  }, [channel]);
+  }, [user]);
 
-  if (!user || !channel) {
+  useEffect(() => {
+    if (user) loadChannel();
+  }, [user, loadChannel]);
+
+  // Seed the form from the merged channel, falling back to the signed-in
+  // profile only when the backend has no channel record yet.
+  useEffect(() => {
+    if (!channel) return;
+    setChannelName(channel.channelName || user?.displayName || "");
+    setHandle(channel.handle || user?.username || "");
+    setDescription(channel.description || user?.bio || "");
+    setContactEmail(channel.contactEmail || "");
+    setProfilePhotoUrl(channel.profilePhotoUrl || user?.avatarUrl || null);
+    setBannerUrl(channel.bannerUrl || user?.bannerUrl || null);
+    setLinks(Array.isArray(channel.links) ? channel.links : []);
+  }, [channel, user]);
+
+  if (!user) {
     return (
       <div className="max-w-3xl mx-auto px-6 py-16 text-sm text-zinc-500">
         Loading your channel...
@@ -61,17 +113,59 @@ function EditChannelContent() {
     );
   }
 
-  const uploadAsset = async (file: File): Promise<string | null> => {
+  if (loadingChannel) {
+    return (
+      <div className="max-w-3xl mx-auto px-6 py-16 flex items-center gap-2 text-sm text-zinc-500">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        Loading your channel...
+      </div>
+    );
+  }
+
+  if (loadError || !channel) {
+    return (
+      <div className="max-w-3xl mx-auto px-6 py-16">
+        <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-5">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-500" />
+            <div>
+              <p className="text-sm font-semibold text-red-500">
+                Could not load your channel
+              </p>
+              <p className="text-xs text-zinc-600 dark:text-zinc-400 mt-1">
+                {loadError || "Something went wrong. Please try again."}
+              </p>
+              <button
+                type="button"
+                onClick={() => loadChannel()}
+                className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-600 hover:bg-red-500 text-white text-xs font-semibold cursor-pointer"
+              >
+                Try again
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const uploadAsset = async (
+    file: File,
+    kind: "photo" | "banner"
+  ): Promise<string | null> => {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("kind", kind);
     try {
-      const res = await fetch(apiUrl("/upload"), { method: "POST", body: formData });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
+      const res = await fetch("/api/channel/upload", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.url) {
         showToast(data?.error || "Upload failed", "error");
         return null;
       }
-      const data = await res.json();
       return data.url as string;
     } catch {
       showToast("Unable to connect. Please try again.", "error");
@@ -86,7 +180,7 @@ function EditChannelContent() {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(kind);
-    const url = await uploadAsset(file);
+    const url = await uploadAsset(file, kind);
     setUploading(null);
     if (e.target) e.target.value = "";
     if (!url) return;
@@ -125,7 +219,7 @@ function EditChannelContent() {
 
     setSaving(true);
     try {
-      const res = await fetch(apiUrl("/channels"), {
+      const res = await fetch("/api/channel", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -138,20 +232,38 @@ function EditChannelContent() {
           links: links.filter((l) => l.label.trim() && l.url.trim()),
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
 
       if (!res.ok || !data?.success) {
-        setError(data?.error || "Something went wrong. Please try again.");
+        setError(
+          data?.error || "Something went wrong. Please try again."
+        );
         return;
       }
 
-      // Only report success once the database update is confirmed.
-      await refreshUser();
+      // Only report success once the save is confirmed. The response carries
+      // the merged channel as stored, so the UI shows the server's truth.
+      const savedChannel = data.data as ChannelData | undefined;
+      if (savedChannel) setChannel(savedChannel);
       triggerFeedRefresh();
       setSaved(true);
-      showToast("Channel updated", "success");
+
+      // Be honest about how far the change travelled: the public backend, or
+      // only this deployment when the backend refused the write.
+      if (data.syncedToBackend) {
+        showToast("Channel updated", "success");
+      } else {
+        showToast(
+          data.syncMessage
+            ? `Saved. The video service did not accept it: ${data.syncMessage}`
+            : "Saved here, but the video service did not accept the change.",
+          "info"
+        );
+      }
+
       router.refresh();
-      router.push(`/channel/${user.id}`);
+      const target = savedChannel?.handle || channel.handle || String(user.id);
+      router.push(`/channel/${encodeURIComponent(target)}`);
     } catch {
       setError("Unable to connect. Please check your internet connection and try again.");
     } finally {
