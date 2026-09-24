@@ -1,139 +1,224 @@
 import { NextResponse } from "next/server";
 import {
-  loadMergedChannel,
+  BACKEND_BASE,
+  adaptChannelDoc,
   readToken,
-  saveChannelPatch,
-  syncChannelToBackend,
+  unwrap,
+  validateImage,
   validatePatch,
-} from "@/lib/channel-store";
+} from "@/lib/channel-api";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 /**
- * GET /api/channel — the signed-in user's channel, merged from the external
- * backend (subscribers/videos/views) and this deployment's local edits
- * (name, handle, description, photo, banner, links, contact email).
+ * Channel read/write for the signed-in user.
  *
- * The backend has no channel-update or image-upload route, so Edit channel
- * reads and writes through here.
+ * BUILD REQUIREMENT: this handler has ZERO dependencies on PostgreSQL,
+ * Drizzle, `@/db`, `@/db/schema` or DATABASE_URL. It is a thin authenticated
+ * proxy to the existing deployed backend
+ * (https://bharattube-ylmq.onrender.com/api/v1), which keeps its data in the
+ * existing MongoDB. Nothing here may import a database client, otherwise
+ * `next build` fails while collecting page data.
+ *
+ * Verified backend routes used:
+ *   GET /channel/me  → the caller's channel
+ *   PUT /channel     → update the caller's channel (PATCH is 404 there)
  */
+
+function jsonError(error: string, status: number) {
+  return NextResponse.json({ success: false, error }, { status });
+}
+
+/** GET /api/channel — the signed-in user's channel from the backend. */
 export async function GET(req: Request) {
   const token = readToken(req);
   if (!token) {
-    return NextResponse.json(
-      { success: false, error: "Sign in to view your channel." },
-      { status: 401 }
-    );
+    return jsonError("Sign in to view your channel.", 401);
   }
 
   try {
-    const loaded = await loadMergedChannel(token);
-    if (!loaded) {
-      return NextResponse.json(
-        { success: false, error: "Your session expired. Please sign in again." },
-        { status: 401 }
-      );
+    const res = await fetch(`${BACKEND_BASE}/channel/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+
+    const payload = await res.json().catch(() => null);
+
+    if (res.status === 401 || res.status === 403) {
+      return jsonError("Your session expired. Please sign in again.", 401);
     }
-    return NextResponse.json({ success: true, data: loaded.channel });
+
+    if (!res.ok) {
+      // The account simply has no channel record yet — report that truthfully
+      // instead of inventing one.
+      return NextResponse.json({
+        success: true,
+        data: { ...adaptChannelDoc(null), exists: false },
+      });
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: adaptChannelDoc(unwrap(payload)),
+    });
   } catch (err) {
     console.error("GET /api/channel failed:", err);
-    return NextResponse.json(
-      { success: false, error: "Could not load your channel. Please try again." },
-      { status: 500 }
+    return jsonError(
+      "Could not reach the video service. Please try again.",
+      502
     );
   }
 }
 
 /**
- * PATCH /api/channel — saves the editable channel fields for the signed-in
- * user. Validates everything server-side, then returns the merged channel so
- * the UI can render the confirmed values (never optimistic ones).
+ * PATCH /api/channel — saves the channel through the backend's PUT /channel.
+ *
+ * Accepts multipart/form-data so newly chosen artwork travels as real file
+ * parts (the backend stores them with its own Cloudinary setup — it exposes
+ * no standalone image route). Text-only saves are forwarded as JSON.
  */
 export async function PATCH(req: Request) {
   const token = readToken(req);
   if (!token) {
-    return NextResponse.json(
-      { success: false, error: "Sign in to edit your channel." },
-      { status: 401 }
-    );
+    return jsonError("Sign in to edit your channel.", 401);
   }
 
-  let body: unknown;
+  /* ---------------- read the incoming edit ---------------- */
+
+  let fields: Record<string, unknown> = {};
+  let logoFile: File | null = null;
+  let bannerFile: File | null = null;
+
+  const contentType = req.headers.get("content-type") || "";
+
   try {
-    body = await req.json();
+    if (contentType.includes("multipart/form-data")) {
+      const form = await req.formData();
+      for (const [key, value] of form.entries()) {
+        if (value instanceof File) {
+          if (key === "logo") logoFile = value;
+          else if (key === "banner") bannerFile = value;
+        } else {
+          fields[key] = value;
+        }
+      }
+    } else {
+      fields = (await req.json()) as Record<string, unknown>;
+    }
   } catch {
-    return NextResponse.json(
-      { success: false, error: "Invalid request." },
-      { status: 400 }
-    );
+    return jsonError("Invalid request.", 400);
   }
 
-  const validated = validatePatch(body);
+  const validated = validatePatch(fields);
   if (!validated.ok) {
-    return NextResponse.json(
-      { success: false, error: validated.error },
-      { status: 400 }
-    );
+    return jsonError(validated.error, 400);
   }
+  const patch = validated.value;
+
+  for (const [file, label] of [
+    [logoFile, "profile picture"],
+    [bannerFile, "banner"],
+  ] as const) {
+    if (file) {
+      const problem = validateImage(file, label);
+      if (problem) return jsonError(problem, 400);
+    }
+  }
+
+  /* ---------------- forward to the backend ---------------- */
+
+  const interpret = (status: number, payload: any) => {
+    const ok = status >= 200 && status < 300 && payload?.success !== false;
+    return {
+      ok,
+      status,
+      message: String(payload?.message || payload?.error || ""),
+      doc: ok ? unwrap(payload) : null,
+    };
+  };
 
   try {
-    // Re-resolves the user id (JWT subject, or authenticated /auth/me).
-    const loaded = await loadMergedChannel(token);
-    if (!loaded) {
-      return NextResponse.json(
-        { success: false, error: "Your session expired. Please sign in again." },
-        { status: 401 }
+    let result: ReturnType<typeof interpret>;
+
+    if (logoFile || bannerFile) {
+      // New artwork: multipart so the backend receives real files.
+      const out = new FormData();
+      out.append("channelName", patch.channelName);
+      out.append("handle", patch.handle);
+      out.append("description", patch.description);
+      if (patch.contactEmail) out.append("contactEmail", patch.contactEmail);
+      out.append("links", JSON.stringify(patch.links));
+
+      if (logoFile) out.append("logo", logoFile, logoFile.name || "logo");
+      else if (patch.logoUrl) out.append("logo", patch.logoUrl);
+
+      if (bannerFile) out.append("banner", bannerFile, bannerFile.name || "banner");
+      else if (patch.bannerUrlValue) out.append("banner", patch.bannerUrlValue);
+
+      const res = await fetch(`${BACKEND_BASE}/channel`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${token}` },
+        body: out,
+        cache: "no-store",
+      });
+      result = interpret(res.status, await res.json().catch(() => null));
+    } else {
+      // Text-only edit.
+      const res = await fetch(`${BACKEND_BASE}/channel`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          channelName: patch.channelName,
+          handle: patch.handle,
+          description: patch.description,
+          contactEmail: patch.contactEmail,
+          links: patch.links,
+          logo: patch.logoUrl ?? "",
+          banner: patch.bannerUrlValue ?? "",
+        }),
+        cache: "no-store",
+      });
+      result = interpret(res.status, await res.json().catch(() => null));
+    }
+
+    if (result.status === 401 || result.status === 403) {
+      return jsonError("Your session expired. Please sign in again.", 401);
+    }
+
+    if (!result.ok) {
+      // Surface the backend's own reason (e.g. "Handle already taken").
+      return jsonError(
+        result.message || "The video service could not save your channel.",
+        result.status >= 400 && result.status < 500 ? result.status : 502
       );
     }
 
-    const patch = { ...validated.value };
-
-    // 1) Push to the REAL backend (PUT /channel) so the change is public and
-    //    visible to every other viewer, not just this deployment.
-    const sync = await syncChannelToBackend(token, patch);
-
-    if (sync.status === 401 || sync.status === 403) {
-      return NextResponse.json(
-        { success: false, error: "Your session expired. Please sign in again." },
-        { status: 401 }
-      );
-    }
-
-    // When the backend stored the images it returns its own hosted URLs.
-    // Prefer those so other viewers load the public copy.
-    if (sync.synced && sync.raw) {
-      const hostedLogo = sync.raw.logo;
-      const hostedBanner = sync.raw.banner;
-      if (typeof hostedLogo === "string" && /^https?:\/\//i.test(hostedLogo)) {
-        patch.profilePhotoUrl = hostedLogo;
-      }
-      if (
-        typeof hostedBanner === "string" &&
-        /^https?:\/\//i.test(hostedBanner)
-      ) {
-        patch.bannerUrl = hostedBanner;
+    // Prefer the document the backend returned; re-read it when the update
+    // response carried no channel body, so the UI always shows stored truth.
+    let doc = result.doc;
+    if (!doc || !doc.handle) {
+      const verify = await fetch(`${BACKEND_BASE}/channel/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+      });
+      if (verify.ok) {
+        doc = unwrap(await verify.json().catch(() => null)) ?? doc;
       }
     }
 
-    // 2) Persist locally. This is the only home for the fields the backend
-    //    does not model (contact email, channel links) and keeps the edit
-    //    intact if the backend rejected the write.
-    await saveChannelPatch(loaded.userId, patch);
-
-    // Read back the merged channel so the response is the confirmed truth.
-    const reloaded = await loadMergedChannel(token);
     return NextResponse.json({
       success: true,
-      data: reloaded?.channel ?? loaded.channel,
-      /** Tells the UI whether the change reached the public backend. */
-      syncedToBackend: sync.synced,
-      syncMessage: sync.synced ? "" : sync.message,
+      data: adaptChannelDoc(doc),
     });
   } catch (err) {
     console.error("PATCH /api/channel failed:", err);
-    return NextResponse.json(
-      { success: false, error: "Could not save your channel. Please try again." },
-      { status: 500 }
+    return jsonError(
+      "Could not reach the video service. Please check your connection and try again.",
+      502
     );
   }
 }

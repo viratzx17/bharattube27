@@ -19,6 +19,8 @@ import { UserAvatar } from "@/components/VideoComponents";
 import { useApp } from "@/context/AppContext";
 
 const HANDLE_RE = /^[a-z0-9_]{3,30}$/;
+const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 /** Channel shape returned by GET /api/channel (backend + local edits merged). */
 interface ChannelData {
@@ -61,6 +63,20 @@ function EditChannelContent() {
 
   const photoInputRef = useRef<HTMLInputElement>(null);
   const bannerInputRef = useRef<HTMLInputElement>(null);
+
+  /** Files chosen but not yet saved — uploaded with the Save request. */
+  const [pendingPhoto, setPendingPhoto] = useState<File | null>(null);
+  const [pendingBanner, setPendingBanner] = useState<File | null>(null);
+  /** Object URLs used for instant preview; revoked when replaced/unmounted. */
+  const photoPreviewRef = useRef<string | null>(null);
+  const bannerPreviewRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (photoPreviewRef.current) URL.revokeObjectURL(photoPreviewRef.current);
+      if (bannerPreviewRef.current) URL.revokeObjectURL(bannerPreviewRef.current);
+    };
+  }, []);
 
   const loadChannel = useCallback(async () => {
     if (!user) return;
@@ -149,44 +165,56 @@ function EditChannelContent() {
     );
   }
 
-  const uploadAsset = async (
-    file: File,
-    kind: "photo" | "banner"
-  ): Promise<string | null> => {
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("kind", kind);
-    try {
-      const res = await fetch("/api/channel/upload", {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data?.url) {
-        showToast(data?.error || "Upload failed", "error");
-        return null;
-      }
-      return data.url as string;
-    } catch {
-      showToast("Unable to connect. Please try again.", "error");
-      return null;
-    }
-  };
-
+  /**
+   * A chosen image is held locally and previewed immediately; the actual file
+   * is sent to the backend with the Save request (the deployed API exposes no
+   * standalone image route, it accepts artwork on PUT /channel).
+   */
   const handleImageChange = async (
     e: React.ChangeEvent<HTMLInputElement>,
     kind: "photo" | "banner"
   ) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(kind);
-    const url = await uploadAsset(file, kind);
-    setUploading(null);
     if (e.target) e.target.value = "";
-    if (!url) return;
-    if (kind === "photo") setProfilePhotoUrl(url);
-    else setBannerUrl(url);
-    setSaved(false);
+    if (!file) return;
+
+    setUploading(kind);
+    try {
+      const mime = (file.type || "").toLowerCase();
+      if (!ALLOWED_IMAGE_TYPES.some((t) => mime.startsWith(t))) {
+        showToast("Choose a PNG, JPEG, WebP or GIF image.", "error");
+        return;
+      }
+      if (file.size <= 0) {
+        showToast("That file appears to be empty.", "error");
+        return;
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        showToast(
+          `Image is too large. Maximum size is ${Math.round(
+            MAX_IMAGE_BYTES / (1024 * 1024)
+          )} MB.`,
+          "error"
+        );
+        return;
+      }
+
+      const previewUrl = URL.createObjectURL(file);
+      if (kind === "photo") {
+        if (photoPreviewRef.current) URL.revokeObjectURL(photoPreviewRef.current);
+        photoPreviewRef.current = previewUrl;
+        setPendingPhoto(file);
+        setProfilePhotoUrl(previewUrl);
+      } else {
+        if (bannerPreviewRef.current) URL.revokeObjectURL(bannerPreviewRef.current);
+        bannerPreviewRef.current = previewUrl;
+        setPendingBanner(file);
+        setBannerUrl(previewUrl);
+      }
+      setSaved(false);
+    } finally {
+      setUploading(null);
+    }
   };
 
   const updateLink = (index: number, patch: Partial<{ label: string; url: string }>) => {
@@ -219,19 +247,41 @@ function EditChannelContent() {
 
     setSaving(true);
     try {
-      const res = await fetch("/api/channel", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          channelName: channelName.trim(),
-          handle: handle.trim(),
-          description: description.trim(),
-          contactEmail: contactEmail.trim(),
-          profilePhotoUrl,
-          bannerUrl,
-          links: links.filter((l) => l.label.trim() && l.url.trim()),
-        }),
-      });
+      const cleanLinks = links.filter((l) => l.label.trim() && l.url.trim());
+      // Only real backend-hosted URLs are resubmitted; a blob: preview is not
+      // a URL the API can store, its file is sent instead.
+      const keepUrl = (v: string | null) =>
+        v && /^https?:\/\//i.test(v) ? v : "";
+
+      let res: Response;
+      if (pendingPhoto || pendingBanner) {
+        const form = new FormData();
+        form.append("channelName", channelName.trim());
+        form.append("handle", handle.trim());
+        form.append("description", description.trim());
+        form.append("contactEmail", contactEmail.trim());
+        form.append("links", JSON.stringify(cleanLinks));
+        form.append("logoUrl", keepUrl(profilePhotoUrl));
+        form.append("bannerUrl", keepUrl(bannerUrl));
+        if (pendingPhoto) form.append("logo", pendingPhoto, pendingPhoto.name);
+        if (pendingBanner) form.append("banner", pendingBanner, pendingBanner.name);
+        res = await fetch("/api/channel", { method: "PATCH", body: form });
+      } else {
+        res = await fetch("/api/channel", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            channelName: channelName.trim(),
+            handle: handle.trim(),
+            description: description.trim(),
+            contactEmail: contactEmail.trim(),
+            logoUrl: keepUrl(profilePhotoUrl),
+            bannerUrl: keepUrl(bannerUrl),
+            links: cleanLinks,
+          }),
+        });
+      }
+
       const data = await res.json().catch(() => null);
 
       if (!res.ok || !data?.success) {
@@ -241,25 +291,26 @@ function EditChannelContent() {
         return;
       }
 
-      // Only report success once the save is confirmed. The response carries
-      // the merged channel as stored, so the UI shows the server's truth.
+      // Only report success once the backend confirms the save. The response
+      // carries the stored channel, so the UI shows the server's truth.
       const savedChannel = data.data as ChannelData | undefined;
       if (savedChannel) setChannel(savedChannel);
+
+      // The pending files are now stored by the backend.
+      setPendingPhoto(null);
+      setPendingBanner(null);
+      if (photoPreviewRef.current) {
+        URL.revokeObjectURL(photoPreviewRef.current);
+        photoPreviewRef.current = null;
+      }
+      if (bannerPreviewRef.current) {
+        URL.revokeObjectURL(bannerPreviewRef.current);
+        bannerPreviewRef.current = null;
+      }
+
       triggerFeedRefresh();
       setSaved(true);
-
-      // Be honest about how far the change travelled: the public backend, or
-      // only this deployment when the backend refused the write.
-      if (data.syncedToBackend) {
-        showToast("Channel updated", "success");
-      } else {
-        showToast(
-          data.syncMessage
-            ? `Saved. The video service did not accept it: ${data.syncMessage}`
-            : "Saved here, but the video service did not accept the change.",
-          "info"
-        );
-      }
+      showToast("Channel updated", "success");
 
       router.refresh();
       const target = savedChannel?.handle || channel.handle || String(user.id);
