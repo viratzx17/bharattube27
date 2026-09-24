@@ -99,72 +99,6 @@ export default function ChannelPage({
     setOwnChannelMissing(false);
 
     try {
-      // OWNER SHORTCUT: the signed-in user's own channel is always viewable
-      // at /channel/<user id> through the same-origin merge route. That route
-      // also returns the edits saved from Edit channel (name, handle,
-      // description, photo, banner, links) which the external backend cannot
-      // store — it has no channel-update or image-upload route.
-      if (user != null && String(id) === String(user.id)) {
-        try {
-          const meRes = await fetch("/api/channel", {
-            credentials: "include",
-            cache: "no-store",
-          });
-          if (meRes.ok) {
-            const mePayload = await meRes.json().catch(() => null);
-            const merged = mePayload?.data;
-            if (mePayload?.success && merged && merged.exists !== false) {
-              setChannel({
-                id: String(merged.id),
-                ownerUserId: String(merged.ownerUserId || user.id),
-                ownerUsername: "",
-                username: String(merged.handle || ""),
-                displayName: String(merged.channelName || ""),
-                avatarUrl: merged.profilePhotoUrl ?? null,
-                bannerUrl: merged.bannerUrl ?? null,
-                bio: String(merged.description || ""),
-                isVerified: Boolean(merged.isVerified),
-                subscriberCount: Number(merged.subscriberCount || 0),
-                isSubscribed: false,
-                totalVideos: Number(merged.videoCount || 0),
-                totalViews: Number(merged.totalViews || 0),
-                createdAt: String(merged.createdAt || ""),
-              });
-
-              const ownerId = String(merged.ownerUserId || user.id);
-              if (ownerId) {
-                const vres = await fetch(
-                  apiUrl(`/videos?userId=${encodeURIComponent(ownerId)}`),
-                  { cache: "no-store" }
-                );
-                if (vres.ok) {
-                  const vpayload = await vres.json();
-                  setVideos(adaptVideos(vpayload) as unknown as VideoItem[]);
-                } else {
-                  setVideos([]);
-                }
-              } else {
-                setVideos([]);
-              }
-              setPlaylists([]);
-              setLoading(false);
-              return;
-            }
-            // The backend has no channel record for this user yet.
-            setOwnChannelMissing(true);
-            setChannel(null);
-            setVideos([]);
-            setPlaylists([]);
-            setLoading(false);
-            return;
-          }
-          // Non-OK response (e.g. expired session): fall through to the
-          // backend path below, which keeps its previous behaviour.
-        } catch {
-          /* fall through to the backend lookup */
-        }
-      }
-
       const res = await fetch(channelApiUrl(id), { cache: "no-store" });
       let payload: unknown = null;
       try {
@@ -267,54 +201,21 @@ export default function ChannelPage({
         return;
       }
 
-      // When the OWNER views their own channel through its handle URL, the
-      // locally-saved edits (which the backend cannot store) are overlaid so
-      // the page always shows what Edit channel saved.
-      let display = adapted;
-      if (
-        user != null &&
-        adapted.ownerUserId &&
-        String(adapted.ownerUserId) === String(user.id)
-      ) {
-        try {
-          const mres = await fetch("/api/channel", {
-            credentials: "include",
-            cache: "no-store",
-          });
-          if (mres.ok) {
-            const mdata = await mres.json().catch(() => null);
-            const m = mdata?.data;
-            if (mdata?.success && m && m.exists !== false) {
-              display = {
-                ...adapted,
-                username: String(m.handle || adapted.username),
-                displayName: String(m.channelName || adapted.displayName),
-                bio: String(m.description ?? adapted.bio),
-                avatarUrl: m.profilePhotoUrl ?? adapted.avatarUrl,
-                bannerUrl: m.bannerUrl ?? adapted.bannerUrl,
-              };
-            }
-          }
-        } catch {
-          /* keep the backend values */
-        }
-      }
-
       setChannel({
-        id: display.id,
-        ownerUserId: display.ownerUserId,
-        ownerUsername: display.ownerUsername,
-        username: display.username,
-        displayName: display.displayName,
-        avatarUrl: display.avatarUrl,
-        bannerUrl: display.bannerUrl,
-        bio: display.bio,
-        isVerified: display.isVerified,
-        subscriberCount: display.subscriberCount,
-        isSubscribed: display.isSubscribed,
-        totalVideos: display.totalVideos,
-        totalViews: display.totalViews,
-        createdAt: display.createdAt,
+        id: adapted.id,
+        ownerUserId: adapted.ownerUserId,
+        ownerUsername: adapted.ownerUsername,
+        username: adapted.username,
+        displayName: adapted.displayName,
+        avatarUrl: adapted.avatarUrl,
+        bannerUrl: adapted.bannerUrl,
+        bio: adapted.bio,
+        isVerified: adapted.isVerified,
+        subscriberCount: adapted.subscriberCount,
+        isSubscribed: adapted.isSubscribed,
+        totalVideos: adapted.totalVideos,
+        totalViews: adapted.totalViews,
+        createdAt: adapted.createdAt,
       });
 
       // Channel videos — real endpoint, keyed by the channel OWNER id.

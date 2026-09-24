@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -17,36 +17,13 @@ import {
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { UserAvatar } from "@/components/VideoComponents";
 import { useApp } from "@/context/AppContext";
+import { apiUrl } from "@/lib/api-config";
 
 const HANDLE_RE = /^[a-z0-9_]{3,30}$/;
-const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-
-/** Channel shape returned by GET /api/channel (backend + local edits merged). */
-interface ChannelData {
-  id: string;
-  handle: string;
-  channelName: string;
-  description: string;
-  contactEmail: string | null;
-  profilePhotoUrl: string | null;
-  bannerUrl: string | null;
-  links: { label: string; url: string }[];
-}
 
 function EditChannelContent() {
-  const { user, triggerFeedRefresh, showToast } = useApp();
+  const { user, channel, refreshUser, triggerFeedRefresh, showToast } = useApp();
   const router = useRouter();
-
-  /**
-   * The channel is loaded from the same-origin /api/channel route, which
-   * merges the external backend's channel (subscribers/videos/views) with
-   * this deployment's stored edits. The context value is always null for
-   * the external backend, so the page owns its own channel state.
-   */
-  const [channel, setChannel] = useState<ChannelData | null>(null);
-  const [loadingChannel, setLoadingChannel] = useState(true);
-  const [loadError, setLoadError] = useState("");
 
   const [channelName, setChannelName] = useState("");
   const [handle, setHandle] = useState("");
@@ -64,64 +41,19 @@ function EditChannelContent() {
   const photoInputRef = useRef<HTMLInputElement>(null);
   const bannerInputRef = useRef<HTMLInputElement>(null);
 
-  /** Files chosen but not yet saved — uploaded with the Save request. */
-  const [pendingPhoto, setPendingPhoto] = useState<File | null>(null);
-  const [pendingBanner, setPendingBanner] = useState<File | null>(null);
-  /** Object URLs used for instant preview; revoked when replaced/unmounted. */
-  const photoPreviewRef = useRef<string | null>(null);
-  const bannerPreviewRef = useRef<string | null>(null);
-
   useEffect(() => {
-    return () => {
-      if (photoPreviewRef.current) URL.revokeObjectURL(photoPreviewRef.current);
-      if (bannerPreviewRef.current) URL.revokeObjectURL(bannerPreviewRef.current);
-    };
-  }, []);
-
-  const loadChannel = useCallback(async () => {
-    if (!user) return;
-    setLoadingChannel(true);
-    setLoadError("");
-    try {
-      const res = await fetch("/api/channel", {
-        cache: "no-store",
-        credentials: "include",
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.success) {
-        setLoadError(
-          data?.error || "Could not load your channel. Please try again."
-        );
-        return;
-      }
-      setChannel(data.data as ChannelData);
-    } catch {
-      setLoadError(
-        "Unable to connect. Please check your internet connection and try again."
-      );
-    } finally {
-      setLoadingChannel(false);
+    if (channel) {
+      setChannelName(channel.channelName || "");
+      setHandle(channel.handle || "");
+      setDescription(channel.description || "");
+      setContactEmail(channel.contactEmail || "");
+      setProfilePhotoUrl(channel.profilePhotoUrl);
+      setBannerUrl(channel.bannerUrl);
+      setLinks(Array.isArray(channel.links) ? channel.links : []);
     }
-  }, [user]);
+  }, [channel]);
 
-  useEffect(() => {
-    if (user) loadChannel();
-  }, [user, loadChannel]);
-
-  // Seed the form from the merged channel, falling back to the signed-in
-  // profile only when the backend has no channel record yet.
-  useEffect(() => {
-    if (!channel) return;
-    setChannelName(channel.channelName || user?.displayName || "");
-    setHandle(channel.handle || user?.username || "");
-    setDescription(channel.description || user?.bio || "");
-    setContactEmail(channel.contactEmail || "");
-    setProfilePhotoUrl(channel.profilePhotoUrl || user?.avatarUrl || null);
-    setBannerUrl(channel.bannerUrl || user?.bannerUrl || null);
-    setLinks(Array.isArray(channel.links) ? channel.links : []);
-  }, [channel, user]);
-
-  if (!user) {
+  if (!user || !channel) {
     return (
       <div className="max-w-3xl mx-auto px-6 py-16 text-sm text-zinc-500">
         Loading your channel...
@@ -129,92 +61,38 @@ function EditChannelContent() {
     );
   }
 
-  if (loadingChannel) {
-    return (
-      <div className="max-w-3xl mx-auto px-6 py-16 flex items-center gap-2 text-sm text-zinc-500">
-        <Loader2 className="w-4 h-4 animate-spin" />
-        Loading your channel...
-      </div>
-    );
-  }
+  const uploadAsset = async (file: File): Promise<string | null> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch(apiUrl("/upload"), { method: "POST", body: formData });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        showToast(data?.error || "Upload failed", "error");
+        return null;
+      }
+      const data = await res.json();
+      return data.url as string;
+    } catch {
+      showToast("Unable to connect. Please try again.", "error");
+      return null;
+    }
+  };
 
-  if (loadError || !channel) {
-    return (
-      <div className="max-w-3xl mx-auto px-6 py-16">
-        <div className="rounded-2xl border border-red-500/30 bg-red-500/10 p-5">
-          <div className="flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-500" />
-            <div>
-              <p className="text-sm font-semibold text-red-500">
-                Could not load your channel
-              </p>
-              <p className="text-xs text-zinc-600 dark:text-zinc-400 mt-1">
-                {loadError || "Something went wrong. Please try again."}
-              </p>
-              <button
-                type="button"
-                onClick={() => loadChannel()}
-                className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-full bg-red-600 hover:bg-red-500 text-white text-xs font-semibold cursor-pointer"
-              >
-                Try again
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  /**
-   * A chosen image is held locally and previewed immediately; the actual file
-   * is sent to the backend with the Save request (the deployed API exposes no
-   * standalone image route, it accepts artwork on PUT /channel).
-   */
   const handleImageChange = async (
     e: React.ChangeEvent<HTMLInputElement>,
     kind: "photo" | "banner"
   ) => {
     const file = e.target.files?.[0];
-    if (e.target) e.target.value = "";
     if (!file) return;
-
     setUploading(kind);
-    try {
-      const mime = (file.type || "").toLowerCase();
-      if (!ALLOWED_IMAGE_TYPES.some((t) => mime.startsWith(t))) {
-        showToast("Choose a PNG, JPEG, WebP or GIF image.", "error");
-        return;
-      }
-      if (file.size <= 0) {
-        showToast("That file appears to be empty.", "error");
-        return;
-      }
-      if (file.size > MAX_IMAGE_BYTES) {
-        showToast(
-          `Image is too large. Maximum size is ${Math.round(
-            MAX_IMAGE_BYTES / (1024 * 1024)
-          )} MB.`,
-          "error"
-        );
-        return;
-      }
-
-      const previewUrl = URL.createObjectURL(file);
-      if (kind === "photo") {
-        if (photoPreviewRef.current) URL.revokeObjectURL(photoPreviewRef.current);
-        photoPreviewRef.current = previewUrl;
-        setPendingPhoto(file);
-        setProfilePhotoUrl(previewUrl);
-      } else {
-        if (bannerPreviewRef.current) URL.revokeObjectURL(bannerPreviewRef.current);
-        bannerPreviewRef.current = previewUrl;
-        setPendingBanner(file);
-        setBannerUrl(previewUrl);
-      }
-      setSaved(false);
-    } finally {
-      setUploading(null);
-    }
+    const url = await uploadAsset(file);
+    setUploading(null);
+    if (e.target) e.target.value = "";
+    if (!url) return;
+    if (kind === "photo") setProfilePhotoUrl(url);
+    else setBannerUrl(url);
+    setSaved(false);
   };
 
   const updateLink = (index: number, patch: Partial<{ label: string; url: string }>) => {
@@ -247,74 +125,33 @@ function EditChannelContent() {
 
     setSaving(true);
     try {
-      const cleanLinks = links.filter((l) => l.label.trim() && l.url.trim());
-      // Only real backend-hosted URLs are resubmitted; a blob: preview is not
-      // a URL the API can store, its file is sent instead.
-      const keepUrl = (v: string | null) =>
-        v && /^https?:\/\//i.test(v) ? v : "";
-
-      let res: Response;
-      if (pendingPhoto || pendingBanner) {
-        const form = new FormData();
-        form.append("channelName", channelName.trim());
-        form.append("handle", handle.trim());
-        form.append("description", description.trim());
-        form.append("contactEmail", contactEmail.trim());
-        form.append("links", JSON.stringify(cleanLinks));
-        form.append("logoUrl", keepUrl(profilePhotoUrl));
-        form.append("bannerUrl", keepUrl(bannerUrl));
-        if (pendingPhoto) form.append("logo", pendingPhoto, pendingPhoto.name);
-        if (pendingBanner) form.append("banner", pendingBanner, pendingBanner.name);
-        res = await fetch("/api/channel", { method: "PATCH", body: form });
-      } else {
-        res = await fetch("/api/channel", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            channelName: channelName.trim(),
-            handle: handle.trim(),
-            description: description.trim(),
-            contactEmail: contactEmail.trim(),
-            logoUrl: keepUrl(profilePhotoUrl),
-            bannerUrl: keepUrl(bannerUrl),
-            links: cleanLinks,
-          }),
-        });
-      }
-
-      const data = await res.json().catch(() => null);
+      const res = await fetch(apiUrl("/channels"), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channelName: channelName.trim(),
+          handle: handle.trim(),
+          description: description.trim(),
+          contactEmail: contactEmail.trim(),
+          profilePhotoUrl,
+          bannerUrl,
+          links: links.filter((l) => l.label.trim() && l.url.trim()),
+        }),
+      });
+      const data = await res.json();
 
       if (!res.ok || !data?.success) {
-        setError(
-          data?.error || "Something went wrong. Please try again."
-        );
+        setError(data?.error || "Something went wrong. Please try again.");
         return;
       }
 
-      // Only report success once the backend confirms the save. The response
-      // carries the stored channel, so the UI shows the server's truth.
-      const savedChannel = data.data as ChannelData | undefined;
-      if (savedChannel) setChannel(savedChannel);
-
-      // The pending files are now stored by the backend.
-      setPendingPhoto(null);
-      setPendingBanner(null);
-      if (photoPreviewRef.current) {
-        URL.revokeObjectURL(photoPreviewRef.current);
-        photoPreviewRef.current = null;
-      }
-      if (bannerPreviewRef.current) {
-        URL.revokeObjectURL(bannerPreviewRef.current);
-        bannerPreviewRef.current = null;
-      }
-
+      // Only report success once the database update is confirmed.
+      await refreshUser();
       triggerFeedRefresh();
       setSaved(true);
       showToast("Channel updated", "success");
-
       router.refresh();
-      const target = savedChannel?.handle || channel.handle || String(user.id);
-      router.push(`/channel/${encodeURIComponent(target)}`);
+      router.push(`/channel/${user.id}`);
     } catch {
       setError("Unable to connect. Please check your internet connection and try again.");
     } finally {
